@@ -1,0 +1,668 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cheapest Lab 8 — EDA: EventBridge + SQS + DynamoDB sobre la infraestructura del Lab 4/7.
+  Despliega ECS (Fargate) para los tres microservicios, RDS PostgreSQL, API Gateway,
+  EventBridge custom bus, SQS queue, DLQ y tabla DynamoDB para el read model CQRS.
+
+Parameters:
+  LogisticaImageUri:
+    Type: String
+    Description: URI completa de la imagen ECR de Logistica (incluido tag 4.0.0)
+  InventarioImageUri:
+    Type: String
+    Description: URI completa de la imagen ECR de Inventario (incluido tag 4.0.0)
+  VentasImageUri:
+    Type: String
+    Description: URI completa de la imagen ECR de Ventas (incluido tag 4.0.0)
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Contrasena para la instancia RDS PostgreSQL
+  DBUsername:
+    Type: String
+    Default: postgres
+  DBName:
+    Type: String
+    Default: Cheapest
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde se desplegara la infraestructura
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subred publica 1 (para ECS y RDS)
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subred publica 2 (para alta disponibilidad de RDS)
+
+Resources:
+
+  # ─── Seguridad ──────────────────────────────────────────────────────────────
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para tareas ECS, ALBs y VPC Link de Cheapest Lab 8
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3003
+          CidrIp: 0.0.0.0/0
+        # Puerto 80: los Listeners de los 3 ALBs escuchan aqui. Sin esta regla, el
+        # VPC Link (que usa este mismo SG) no puede alcanzar los ALBs y API Gateway
+        # responde 503 "Service Unavailable" para toda ruta, aunque los targets del
+        # ALB ya esten healthy.
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab8-ecs-sg
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG para RDS PostgreSQL de Cheapest Lab 8
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab8-rds-sg
+
+  # ─── RDS PostgreSQL ──────────────────────────────────────────────────────────
+
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Cheapest Lab 8 RDS
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  RdsInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: Cheapest-lab8-postgres
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      EngineVersion: '15'
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      AllocatedStorage: '20'
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      DeletionProtection: false
+
+  # ─── EventBridge ─────────────────────────────────────────────────────────────
+
+  CheapestEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: Cheapest-bus
+
+  # ─── SQS ─────────────────────────────────────────────────────────────────────
+
+  VentaCreadaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: Cheapest-venta-creada-dlq
+      MessageRetentionPeriod: 1209600  # 14 días
+
+  VentaCreadaQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: Cheapest-venta-creada
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt VentaCreadaDLQ.Arn
+        maxReceiveCount: 3
+
+  VentaCreadaQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref VentaCreadaQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt VentaCreadaQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/Cheapest-bus/Cheapest-venta-creada-rule
+
+  # ─── EventBridge Rule: VentaCreada → SQS ────────────────────────────────────
+
+  VentaCreadaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Cheapest-venta-creada-rule
+      EventBusName: !Ref CheapestEventBus
+      EventPattern:
+        source:
+          - cheapest.ventas
+        detail-type:
+          - VentaCreada
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt VentaCreadaQueue.Arn
+          Id: VentaCreadaQueueTarget
+
+  # ─── DynamoDB: Read Model CQRS ───────────────────────────────────────────────
+
+  ResumenTiendaTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Cheapest-resumen-tienda
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tiendaId
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tiendaId
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  # ─── IAM Roles ───────────────────────────────────────────────────────────────
+  # Este template NO crea roles IAM propios: en un AWS Academy Learner Lab (el
+  # caso más común en este curso) el rol del estudiante no tiene iam:CreateRole.
+  # Todas las tareas ECS (ejecución y aplicación) usan el rol ya provisto por el
+  # Learner Lab (`LabRole`), que en Academy normalmente ya incluye permisos amplios
+  # sobre EventBridge, DynamoDB y SQS para fines de aprendizaje. Si su cuenta no es
+  # un Learner Lab y no existe `LabRole`, cree un rol equivalente con permiso
+  # `sts:AssumeRole` para `ecs-tasks.amazonaws.com` y acceso a EventBridge/DynamoDB/SQS.
+
+  # ─── ECS Cluster ─────────────────────────────────────────────────────────────
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: Cheapest-lab8-cluster
+
+  # ─── CloudWatch Log Groups ───────────────────────────────────────────────────
+
+  LogGroupLogistica:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/Cheapest-lab8-logistica
+      RetentionInDays: 3
+
+  LogGroupInventario:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/Cheapest-lab8-inventario
+      RetentionInDays: 3
+
+  LogGroupVentas:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/Cheapest-lab8-ventas
+      RetentionInDays: 3
+
+  # ─── ECS Task Definitions ────────────────────────────────────────────────────
+
+  TaskDefLogistica:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: Cheapest-lab8-logistica
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: logistica
+          Image: !Ref LogisticaImageUri
+          PortMappings:
+            - ContainerPort: 3001
+          Environment:
+            - Name: PORT
+              Value: '3001'
+            - Name: DB_HOST
+              Value: !GetAtt RdsInstance.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USERNAME
+              Value: !Ref DBUsername
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: EVENTBRIDGE_BUS_NAME
+              Value: Cheapest-bus
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-lab8-logistica
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefInventario:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: Cheapest-lab8-inventario
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: inventario
+          Image: !Ref InventarioImageUri
+          PortMappings:
+            - ContainerPort: 3002
+          Environment:
+            - Name: PORT
+              Value: '3002'
+            - Name: DB_HOST
+              Value: !GetAtt RdsInstance.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USERNAME
+              Value: !Ref DBUsername
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: LOGISTICA_BASE_URL
+              Value: !Sub http://${LogisticaALB.DNSName}
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_VENTA_CREADA_URL
+              Value: !Ref VentaCreadaQueue
+            - Name: DYNAMO_TABLE_RESUMEN
+              Value: Cheapest-resumen-tienda
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-lab8-inventario
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  TaskDefVentas:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: Cheapest-lab8-ventas
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      TaskRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: ventas
+          Image: !Ref VentasImageUri
+          PortMappings:
+            - ContainerPort: 3003
+          Environment:
+            - Name: PORT
+              Value: '3003'
+            - Name: DB_HOST
+              Value: !GetAtt RdsInstance.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USERNAME
+              Value: !Ref DBUsername
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: LOGISTICA_BASE_URL
+              Value: !Sub http://${LogisticaALB.DNSName}
+            - Name: LOGISTICA_TIMEOUT_MS
+              Value: '8000'
+            - Name: INVENTARIO_BASE_URL
+              Value: !Sub http://${InventarioALB.DNSName}
+            - Name: INVENTARIO_TIMEOUT_MS
+              Value: '8000'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: EVENTBRIDGE_BUS_NAME
+              Value: Cheapest-bus
+            - Name: DYNAMO_TABLE_RESUMEN
+              Value: Cheapest-resumen-tienda
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-lab8-ventas
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ─── ALBs internos para comunicación entre servicios ────────────────────────
+
+  LogisticaALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Cheapest-lab8-logistica-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EcsSecurityGroup
+
+  LogisticaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Cheapest-lab8-logistica-tg
+      Port: 3001
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  LogisticaListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LogisticaALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LogisticaTargetGroup
+
+  InventarioALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Cheapest-lab8-inventario-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EcsSecurityGroup
+
+  InventarioTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Cheapest-lab8-inventario-tg
+      Port: 3002
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  InventarioListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InventarioALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref InventarioTargetGroup
+
+  VentasALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Cheapest-lab8-ventas-alb
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EcsSecurityGroup
+
+  VentasTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Cheapest-lab8-ventas-tg
+      Port: 3003
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  VentasListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref VentasALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref VentasTargetGroup
+
+  # ─── ECS Services ────────────────────────────────────────────────────────────
+
+  EcsServiceLogistica:
+    Type: AWS::ECS::Service
+    DependsOn: LogisticaListener
+    Properties:
+      ServiceName: Cheapest-lab8-logistica
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefLogistica
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+      LoadBalancers:
+        - ContainerName: logistica
+          ContainerPort: 3001
+          TargetGroupArn: !Ref LogisticaTargetGroup
+
+  EcsServiceInventario:
+    Type: AWS::ECS::Service
+    DependsOn: InventarioListener
+    Properties:
+      ServiceName: Cheapest-lab8-inventario
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefInventario
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+      LoadBalancers:
+        - ContainerName: inventario
+          ContainerPort: 3002
+          TargetGroupArn: !Ref InventarioTargetGroup
+
+  EcsServiceVentas:
+    Type: AWS::ECS::Service
+    DependsOn: VentasListener
+    Properties:
+      ServiceName: Cheapest-lab8-ventas
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefVentas
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+      LoadBalancers:
+        - ContainerName: ventas
+          ContainerPort: 3003
+          TargetGroupArn: !Ref VentasTargetGroup
+
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Cheapest-lab8-api
+      ProtocolType: HTTP
+
+  ApiGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: lab
+      AutoDeploy: true
+
+  # IMPORTANTE: este template usaba antes una integracion VPC_LINK apuntando al Listener ARN
+  # de cada ALB. En pruebas sobre una cuenta de AWS Academy Learner Lab, esa combinacion
+  # (API Gateway VPC Link -> ALB Listener directo, sin Network Load Balancer intermedio)
+  # devolvio consistentemente 503 Service Unavailable con ~9s de latencia de integracion,
+  # pese a que el ALB, sus targets y el security group estaban correctamente configurados
+  # (confirmado probando el ALB directamente: 200 OK). Esto aparenta ser una restriccion de
+  # red propia del sandbox, no un error de configuracion. Como los 3 ALBs ya son
+  # internet-facing (ver LogisticaALB/InventarioALB/VentasALB mas arriba), la solucion mas
+  # simple y confiable es integrar API Gateway directamente contra el DNS publico del ALB
+  # (HTTP_PROXY con ConnectionType INTERNET, igual que en el Lab 4), sin VPC Link.
+  #
+  # Requiere DOS integraciones por servicio: una para las rutas de negocio (con proxy,
+  # reescribiendo el prefijo espanol al prefijo real del backend) y otra para /health
+  # (ruta fija, sin prefijo, ya que el HealthController de cada microservicio expone
+  # /health en la raiz del contenedor).
+  IntegrationLogistica:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'http://${LogisticaALB.DNSName}/logistics/{proxy}'
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+
+  IntegrationLogisticaHealth:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: !Sub 'http://${LogisticaALB.DNSName}/health'
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+
+  IntegrationInventario:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'http://${InventarioALB.DNSName}/inventory/{proxy}'
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+
+  IntegrationInventarioHealth:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: !Sub 'http://${InventarioALB.DNSName}/health'
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+
+  IntegrationVentas:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'http://${VentasALB.DNSName}/ventas/{proxy}'
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+
+  IntegrationVentasHealth:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: !Sub 'http://${VentasALB.DNSName}/health'
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+
+  RouteLogistica:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: ANY /logistica/{proxy+}
+      Target: !Sub integrations/${IntegrationLogistica}
+
+  RouteLogisticaHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /logistica/health
+      Target: !Sub integrations/${IntegrationLogisticaHealth}
+
+  RouteInventario:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: ANY /inventario/{proxy+}
+      Target: !Sub integrations/${IntegrationInventario}
+
+  RouteInventarioHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /inventario/health
+      Target: !Sub integrations/${IntegrationInventarioHealth}
+
+  RouteVentas:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: ANY /ventas/{proxy+}
+      Target: !Sub integrations/${IntegrationVentas}
+
+  RouteVentasHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: GET /ventas/health
+      Target: !Sub integrations/${IntegrationVentasHealth}
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+
+Outputs:
+  ApiGatewayUrl:
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/lab
+    Description: URL base del API Gateway para el laboratorio
+  EventBusBusName:
+    Value: Cheapest-bus
+    Description: Nombre del custom bus de EventBridge
+  VentaCreadaQueueUrl:
+    Value: !Ref VentaCreadaQueue
+    Description: URL de la cola SQS para el consumer de Inventario
+  VentaCreadaDLQUrl:
+    Value: !Ref VentaCreadaDLQ
+    Description: URL de la Dead Letter Queue
+  ResumenTiendaTableName:
+    Value: Cheapest-resumen-tienda
+    Description: Nombre de la tabla DynamoDB del read model CQRS
+  RdsEndpoint:
+    Value: !GetAtt RdsInstance.Endpoint.Address
+    Description: Endpoint de la instancia RDS PostgreSQL

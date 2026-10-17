@@ -1,0 +1,757 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Cheapest Lab 5 — Infraestructura de microservicios con resiliencia.
+  Despliega VPC, RDS, ECS/Fargate (3 servicios) y API Gateway HTTP.
+
+# ---------------------------------------------------------------------------
+# PARÁMETROS
+# Valores que usted debe proveer al ejecutar `aws cloudformation deploy`.
+# ---------------------------------------------------------------------------
+Parameters:
+
+  LogisticaImageUri:
+    Type: String
+    Description: URI completo de la imagen ECR para el servicio Logistica (ej. 123456789.dkr.ecr.us-east-1.amazonaws.com/cheapest-logistica:2.0.0)
+
+  InventarioImageUri:
+    Type: String
+    Description: URI completo de la imagen ECR para el servicio Inventario
+
+  VentasImageUri:
+    Type: String
+    Description: URI completo de la imagen ECR para el servicio Ventas
+
+  VentasSidecarImageUri:
+    Type: String
+    Description: URI completo de la imagen ECR del sidecar Envoy (construida desde apps/ventas/sidecar/Dockerfile)
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Contraseña para el usuario postgres de RDS (mínimo 8 caracteres)
+
+  DBName:
+    Type: String
+    Default: Cheapest
+    Description: Nombre de la base de datos PostgreSQL
+
+  DBUser:
+    Type: String
+    Default: postgres
+    Description: Usuario administrador de PostgreSQL
+
+  FaultDelayMs:
+    Type: String
+    Default: '0'
+    Description: >
+      Delay en ms que Inventario agrega artificialmente a sus respuestas (0 = sin fallo).
+      Cambie a 5000 para reproducir la degradación del lab.
+
+  RecoveryTimeMs:
+    Type: String
+    Default: '60000'
+    Description: >
+      Tiempo en ms desde el arranque del proceso hasta que Inventario se recupera automáticamente.
+      Con FaultDelayMs=5000 y RecoveryTimeMs=60000, el servicio está degradado durante 60s y luego
+      vuelve a la normalidad, simulando un reinicio automático por ECS health checks.
+
+# ---------------------------------------------------------------------------
+# RECURSOS
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # RED: VPC, Subnets, Internet Gateway, Route Tables
+  # =========================================================================
+
+  # VPC principal del laboratorio
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-vpc
+
+  # Subnet pública A — usada por los ALBs (deben estar en al menos 2 AZs)
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-public-b
+
+  # Subnet privada A — usada por las tareas ECS y RDS (sin IP pública)
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-private-b
+
+  # Internet Gateway — permite que las subnets públicas salgan a internet
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # =========================================================================
+  # SECURITY GROUPS
+  # =========================================================================
+
+  # Permite tráfico HTTP desde internet hacia los ALBs
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite trafico HTTP entrante hacia los ALBs
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-alb-sg
+
+  # Permite tráfico HTTP desde los ALBs hacia las tareas ECS
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite trafico desde los ALBs hacia los contenedores ECS
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3003
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-ecs-sg
+
+  # Comunicación interna entre servicios (Ventas → Inventario).
+  # IMPORTANTE: esta regla NO puede ir dentro de las SecurityGroupIngress inline de
+  # ECSSecurityGroup de arriba: un security group no puede referenciarse a si mismo dentro
+  # de sus propias Properties (el recurso todavia no tiene ID mientras se esta definiendo),
+  # y CloudFormation rechaza el template entero con "Circular dependency between resources"
+  # (el ciclo se propaga a casi todo lo demás porque RDS, ECS Services, etc. dependen de este
+  # security group). Por eso se declara como un recurso AWS::EC2::SecurityGroupIngress aparte,
+  # que se crea DESPUES de que ECSSecurityGroup ya existe.
+  ECSSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3001
+      ToPort: 3003
+      SourceSecurityGroupId: !Ref ECSSecurityGroup
+
+  # Solo permite acceso a PostgreSQL desde las tareas ECS
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite acceso a PostgreSQL solo desde ECS
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: Cheapest-lab5-rds-sg
+
+  # =========================================================================
+  # BASE DE DATOS: RDS PostgreSQL
+  # =========================================================================
+
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets privadas para RDS de Cheapest Lab 5
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  # Instancia RDS PostgreSQL — db.t3.micro es suficiente para el laboratorio
+  CheapestDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete  # Eliminar al hacer delete-stack (apropiado para lab)
+    Properties:
+      DBInstanceIdentifier: Cheapest-lab5-db
+      DBName: !Ref DBName
+      Engine: postgres
+      EngineVersion: '15'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 0  # Sin backups automáticos en laboratorio
+
+  # =========================================================================
+  # ECS: Cluster, Roles IAM, Task Definitions y Servicios
+  # =========================================================================
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: Cheapest-lab5-cluster
+
+  # --- LOGÍSTICA ---
+
+  LogisticaTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: td-Cheapest-logistica
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: logistica
+          Image: !Ref LogisticaImageUri
+          PortMappings:
+            - ContainerPort: 3001
+          Environment:
+            - Name: PORT
+              Value: '3001'
+            - Name: DB_HOST
+              Value: !GetAtt CheapestDB.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: !Ref DBName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-logistica
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+
+  LogisticaALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Cheapest-lab5-logistica-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  LogisticaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Cheapest-lab5-logistica-tg
+      Port: 3001
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref LabVPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  LogisticaListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LogisticaALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref LogisticaTargetGroup
+
+  LogisticaService:
+    Type: AWS::ECS::Service
+    DependsOn: LogisticaListener
+    Properties:
+      ServiceName: svc-Cheapest-logistica
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref LogisticaTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: logistica
+          ContainerPort: 3001
+          TargetGroupArn: !Ref LogisticaTargetGroup
+
+  # --- INVENTARIO ---
+
+  InventarioTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: td-Cheapest-inventario
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: inventario
+          Image: !Ref InventarioImageUri
+          PortMappings:
+            - ContainerPort: 3002
+          Environment:
+            - Name: PORT
+              Value: '3002'
+            - Name: DB_HOST
+              Value: !GetAtt CheapestDB.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: !Ref DBName
+            # FAULT_DELAY_MS: delay artificial por request durante el período de fallo
+            - Name: FAULT_DELAY_MS
+              Value: !Ref FaultDelayMs
+            # RECOVERY_TIME_MS: tiempo desde el arranque hasta la auto-recuperación
+            - Name: RECOVERY_TIME_MS
+              Value: !Ref RecoveryTimeMs
+            # Inventario también valida existencia de producto contra Logística
+            # (LogisticaProductosClient) antes de crear un item_inventario. Mismo caso que
+            # Ventas: sin esta variable cae a 'http://localhost:3001' y falla con
+            # "Logistica service is unavailable".
+            - Name: LOGISTICA_BASE_URL
+              Value: !Sub 'http://${LogisticaALB.DNSName}'
+            - Name: LOGISTICA_TIMEOUT_MS
+              Value: '5000'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-inventario
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+
+  InventarioALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Cheapest-lab5-inventario-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  InventarioTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Cheapest-lab5-inventario-tg
+      Port: 3002
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref LabVPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  InventarioListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref InventarioALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref InventarioTargetGroup
+
+  InventarioService:
+    Type: AWS::ECS::Service
+    DependsOn: InventarioListener
+    Properties:
+      ServiceName: svc-Cheapest-inventario
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref InventarioTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: inventario
+          ContainerPort: 3002
+          TargetGroupArn: !Ref InventarioTargetGroup
+
+  # --- VENTAS ---
+
+  VentasTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: td-Cheapest-ventas
+      # 512/1024 en lugar de 256/512: la tarea ahora corre dos contenedores (app + sidecar Envoy)
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      ContainerDefinitions:
+        - Name: ventas
+          Image: !Ref VentasImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3003
+          Environment:
+            - Name: PORT
+              Value: '3003'
+            - Name: DB_HOST
+              Value: !GetAtt CheapestDB.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_USER
+              Value: !Ref DBUser
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DB_NAME
+              Value: !Ref DBName
+            # Ventas NO llama a Inventario directamente: pasa por el sidecar Envoy (localhost:10000),
+            # que corre en el mismo task (awsvpc comparte namespace de red -> "localhost" = mismo task).
+            # Esto es lo que permite que retry/circuit breaker se apliquen sin tocar el código de Ventas.
+            - Name: INVENTARIO_BASE_URL
+              Value: 'http://localhost:10000'
+            # Debe ser mayor que el timeout total de la ruta en el sidecar; sin esta variable el
+            # cliente usa 3000 ms por defecto y abortaría antes de que Envoy termine sus reintentos.
+            - Name: INVENTARIO_TIMEOUT_MS
+              Value: '9000'
+            # Ventas también valida existencia de producto contra Logística (LogisticaProductosClient).
+            # Logística corre en un ECS Service DISTINTO (no comparte red con Ventas), así que debe
+            # apuntar al ALB de Logística; sin esta variable, el cliente cae a su default
+            # 'http://localhost:3001', que no resuelve a nada dentro del task de Ventas.
+            - Name: LOGISTICA_BASE_URL
+              Value: !Sub 'http://${LogisticaALB.DNSName}'
+            - Name: LOGISTICA_TIMEOUT_MS
+              Value: '5000'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-ventas
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+        # Sidecar Envoy: intercepta el tráfico de Ventas hacia Inventario y aplica
+        # retry/circuit breaker según libs/../envoy.yaml.tmpl (apps/ventas/sidecar/).
+        - Name: ventas-sidecar
+          Image: !Ref VentasSidecarImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 10000
+            - ContainerPort: 9901
+          Environment:
+            # Inventario corre en un ECS Service/task DISTINTO al de Ventas (no comparten
+            # namespace de red), así que el sidecar lo alcanza vía el ALB de Inventario,
+            # no por localhost. Ver apps/ventas/sidecar/envoy.yaml.tmpl, caso "ECS cross-task".
+            - Name: INVENTARIO_UPSTREAM_HOST
+              Value: !GetAtt InventarioALB.DNSName
+            - Name: INVENTARIO_UPSTREAM_PORT
+              Value: '80'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/Cheapest-ventas-sidecar
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+
+  VentasALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: Cheapest-lab5-ventas-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+
+  VentasTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: Cheapest-lab5-ventas-tg
+      Port: 3003
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref LabVPC
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+
+  VentasListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref VentasALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref VentasTargetGroup
+
+  VentasService:
+    Type: AWS::ECS::Service
+    DependsOn: VentasListener
+    Properties:
+      ServiceName: svc-Cheapest-ventas
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref VentasTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnetA
+            - !Ref PublicSubnetB
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: ventas
+          ContainerPort: 3003
+          TargetGroupArn: !Ref VentasTargetGroup
+
+  # =========================================================================
+  # API GATEWAY HTTP: enruta /logistica/*, /inventario/*, /ventas/*
+  # =========================================================================
+
+  CheapestHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Cheapest-ms-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+        AllowHeaders:
+          - '*'
+
+  # Integraciones: reenvía cada ruta al ALB del servicio correspondiente.
+  # IMPORTANTE: el prefijo de la ruta expuesta al estudiante (/logistica, /inventario) es en
+  # español, pero el codigo de los controladores usa prefijos en ingles (logistics, inventory) —
+  # solo "ventas" coincide. El URI de integracion debe traducir al prefijo real del backend,
+  # si no toda request via API Gateway devuelve 404.
+  LogisticaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'http://${LogisticaALB.DNSName}/logistics/{proxy}'
+      PayloadFormatVersion: '1.0'
+
+  InventarioIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'http://${InventarioALB.DNSName}/inventory/{proxy}'
+      PayloadFormatVersion: '1.0'
+
+  VentasIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'http://${VentasALB.DNSName}/ventas/{proxy}'
+      PayloadFormatVersion: '1.0'
+
+  LogisticaRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      RouteKey: 'ANY /logistica/{proxy+}'
+      Target: !Sub 'integrations/${LogisticaIntegration}'
+
+  InventarioRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      RouteKey: 'ANY /inventario/{proxy+}'
+      Target: !Sub 'integrations/${InventarioIntegration}'
+
+  VentasRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      RouteKey: 'ANY /ventas/{proxy+}'
+      Target: !Sub 'integrations/${VentasIntegration}'
+
+  # Health checks: cada microservicio expone /health SIN prefijo (a diferencia de las rutas
+  # de negocio), por eso necesitan su propia integracion de ruta fija en vez de compartir el
+  # proxy de negocio de arriba.
+  LogisticaHealthIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: !Sub 'http://${LogisticaALB.DNSName}/health'
+      PayloadFormatVersion: '1.0'
+
+  InventarioHealthIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: !Sub 'http://${InventarioALB.DNSName}/health'
+      PayloadFormatVersion: '1.0'
+
+  VentasHealthIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: GET
+      IntegrationUri: !Sub 'http://${VentasALB.DNSName}/health'
+      PayloadFormatVersion: '1.0'
+
+  LogisticaHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      RouteKey: 'GET /logistica/health'
+      Target: !Sub 'integrations/${LogisticaHealthIntegration}'
+
+  InventarioHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      RouteKey: 'GET /inventario/health'
+      Target: !Sub 'integrations/${InventarioHealthIntegration}'
+
+  VentasHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      RouteKey: 'GET /ventas/health'
+      Target: !Sub 'integrations/${VentasHealthIntegration}'
+
+  # Stage con throttling habilitado (Táctica 3 del lab)
+  # Rate y Burst se configuran manualmente desde la consola según las instrucciones del lab
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref CheapestHttpApi
+      StageName: lab
+      AutoDeploy: true
+      DefaultRouteSettings:
+        # Throttling desactivado al inicio — se activa manualmente en la Parte 2, Táctica 3
+        ThrottlingBurstLimit: 5000
+        ThrottlingRateLimit: 1000
+
+# ---------------------------------------------------------------------------
+# OUTPUTS
+# Valores exportados tras el despliegue. Úselos para verificar la instalación.
+# ---------------------------------------------------------------------------
+Outputs:
+
+  ApiGatewayUrl:
+    Description: URL base del API Gateway para el laboratorio
+    Value: !Sub 'https://${CheapestHttpApi}.execute-api.${AWS::Region}.amazonaws.com/lab'
+
+  RDSEndpoint:
+    Description: Endpoint de la base de datos RDS
+    Value: !GetAtt CheapestDB.Endpoint.Address
+
+  LogisticaALBDns:
+    Description: DNS del ALB de Logistica
+    Value: !GetAtt LogisticaALB.DNSName
+
+  InventarioALBDns:
+    Description: DNS del ALB de Inventario
+    Value: !GetAtt InventarioALB.DNSName
+
+  VentasALBDns:
+    Description: DNS del ALB de Ventas
+    Value: !GetAtt VentasALB.DNSName
