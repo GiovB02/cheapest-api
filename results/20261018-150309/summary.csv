@@ -1,0 +1,3 @@
+start_iso,end_iso,test,rep,threads_total,get_threads,post_threads,ramp_s,duration_s,endpoint,n,p99_ms,p95_ms,avg_ms,throughput_rps,error_pct,total_throughput_rps
+2026-10-18T20:03:10.854345+00:00,2026-10-18T20:03:15.308774+00:00,Smoke test,1,10,7,3,5,4.5,GET,7,160.1,156.6,140.2,1.57,0.00,2.25
+2026-10-18T20:03:10.854345+00:00,2026-10-18T20:03:15.308774+00:00,Smoke test,1,10,7,3,5,4.5,POST,3,494.8,471.1,296.2,0.67,0.00,2.25
