@@ -1,0 +1,19 @@
+﻿{
+  "archivo": "C:\\Users\\Giovanna\\OneDrive - Escuela Superior de Economia y Negocios\\Documentos\\UNIANDES\\ArquitecturaDeSoftwareRobustas\\Laboratorios\\cheapest-api\\lab5-pruebas\\resultados\\outbox_sano_500hilos.jtl",
+  "peticiones": 500,
+  "p50_ms": 310,
+  "p95_ms": 10317,
+  "p99_ms": 10374,
+  "max_ms": 20030,
+  "error_pct": 0.4,
+  "throughput_rps": 7.87,
+  "respuestas_201": 498,
+  "con_pending_stock_confirmation": 0,
+  "pct_429": 0,
+  "codigos": {
+    "201": 498,
+    "Non HTTP response code: org.apache.http.conn.ConnectTimeoutException": 2
+  },
+  "inicio": "2026-10-25T19:01:30.761Z",
+  "fin": "2026-10-25T19:02:34.329Z"
+}

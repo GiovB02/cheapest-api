@@ -1,0 +1,19 @@
+﻿{
+  "archivo": "lab5-pruebas\\resultados\\ronda1_1500hilos.jtl",
+  "peticiones": 1500,
+  "p50_ms": 5307,
+  "p95_ms": 15309,
+  "p99_ms": 15382,
+  "max_ms": 20013,
+  "error_pct": 0.13,
+  "throughput_rps": 16.2,
+  "respuestas_201": 1498,
+  "con_pending_stock_confirmation": 0,
+  "pct_429": 0,
+  "codigos": {
+    "201": 1498,
+    "Non HTTP response code: org.apache.http.conn.ConnectTimeoutException": 2
+  },
+  "inicio": "2026-10-25T05:30:04.040Z",
+  "fin": "2026-10-25T05:31:36.620Z"
+}

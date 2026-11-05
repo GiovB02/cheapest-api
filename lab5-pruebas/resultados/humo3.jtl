@@ -1,0 +1,5 @@
+timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect
+1792953147378,5590,POST /ventas/ventas,201,PENDING,Carga (threads y rampup por -J) 1-2,text,true,,1036,516,4,4,https://7umdj0brv9.execute-api.us-east-2.amazonaws.com/lab/ventas/ventas,5586,0,373
+1792953147852,5313,POST /ventas/ventas,201,PENDING,Carga (threads y rampup por -J) 1-4,text,true,,1036,516,4,4,https://7umdj0brv9.execute-api.us-east-2.amazonaws.com/lab/ventas/ventas,5313,0,188
+1792953147193,5775,POST /ventas/ventas,201,PENDING,Carga (threads y rampup por -J) 1-1,text,true,,1036,516,4,4,https://7umdj0brv9.execute-api.us-east-2.amazonaws.com/lab/ventas/ventas,5771,0,558
+1792953147624,5344,POST /ventas/ventas,201,Created,Carga (threads y rampup por -J) 1-3,text,true,,908,516,4,4,https://7umdj0brv9.execute-api.us-east-2.amazonaws.com/lab/ventas/ventas,5340,0,197

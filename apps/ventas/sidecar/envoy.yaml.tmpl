@@ -53,6 +53,12 @@ static_resources:
       connect_timeout: 2s
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
+      # Sin esto el circuit breaker no abre: al expulsar (eyectar) a Inventario quedan menos del 50 %
+      # de hosts sanos, Envoy entra en "modo panico" y manda trafico igual al host expulsado.
+      # Con umbral 0 el circuito abierto responde 503 UH ("no healthy upstream") de inmediato.
+      common_lb_config:
+        healthy_panic_threshold:
+          value: 0
       load_assignment:
         cluster_name: inventario_cluster
         endpoints:

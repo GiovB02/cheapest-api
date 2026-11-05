@@ -106,8 +106,10 @@ async function seedDatabase() {
         'SELECT COUNT(*)::int AS count FROM items_inventario',
       );
 
-      if ((rows[0]?.count ?? 0) > 0) {
-        console.log('Database already seeded. Skipping.');
+      if ((rows[0]?.count ?? 0) > 0 && process.env.SEED_FORCE !== 'true') {
+        console.log(
+          'Database already seeded. Skipping. (SEED_FORCE=true para resembrar)',
+        );
         return;
       }
     }
@@ -117,16 +119,35 @@ async function seedDatabase() {
       '../libs/shared/database/src/seed.sql',
     );
     const sql = fs.readFileSync(sqlPath, 'utf8');
+    // Cada sentencia viene precedida por líneas de comentario (`-- ...`): se
+    // quitan antes de filtrar, o todas las sentencias se descartarían.
     const statements = sql
       .split(';')
-      .map((statement) => statement.trim())
-      .filter(
-        (statement) => statement.length > 0 && !statement.startsWith('--'),
-      );
+      .map((statement) =>
+        statement
+          .split(/\r?\n/)
+          .filter((line) => !line.trim().startsWith('--'))
+          .join('\n')
+          .trim(),
+      )
+      .filter((statement) => statement.length > 0);
 
-    for (const statement of statements) {
-      await dataSource.query(statement);
-    }
+    // Todo en una transacción: si una sentencia falla, no queda una siembra a
+    // medias que el chequeo de "already seeded" tomaría como completa.
+    await dataSource.transaction(async (manager) => {
+      if (process.env.SEED_FORCE === 'true') {
+        await manager.query(
+          `TRUNCATE TABLE items_inventario, registros_compra_producto_tienda,
+            registros_venta_producto_tienda, productos, catalogos,
+            promociones, pedidos, items_pedido, despachos, disponibilidad_zona,
+            notas_credito CASCADE`,
+        );
+      }
+
+      for (const statement of statements) {
+        await manager.query(statement);
+      }
+    });
 
     console.log('Database seeded successfully.');
   } finally {

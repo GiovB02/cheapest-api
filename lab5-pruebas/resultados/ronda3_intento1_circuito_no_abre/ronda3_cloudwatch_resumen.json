@@ -1,0 +1,11 @@
+﻿{
+    "ronda":  "3",
+    "T0":  "10:36:22",
+    "ventana_cloudwatch":  "2026-10-25T16:36:22Z .. 2026-10-25T16:50:22Z",
+    "requestcount_inventario_total":  8519,
+    "http5xx_inventario_total":  null,
+    "ventas_201_matriz":  2247,
+    "ventas_201_sonda":  119,
+    "ventas_201_total":  2366,
+    "llamadas_disponibilidad":  6153
+}

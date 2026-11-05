@@ -1,0 +1,18 @@
+﻿{
+  "archivo": "C:\\Users\\Giovanna\\OneDrive - Escuela Superior de Economia y Negocios\\Documentos\\UNIANDES\\ArquitecturaDeSoftwareRobustas\\Laboratorios\\cheapest-api\\lab5-pruebas\\resultados\\ronda2_50hilos.jtl",
+  "peticiones": 50,
+  "p50_ms": 5301,
+  "p95_ms": 5350,
+  "p99_ms": 5662,
+  "max_ms": 5662,
+  "error_pct": 0,
+  "throughput_rps": 3.33,
+  "respuestas_201": 50,
+  "con_pending_stock_confirmation": 42,
+  "pct_429": 0,
+  "codigos": {
+    "201": 50
+  },
+  "inicio": "2026-10-25T16:07:02.586Z",
+  "fin": "2026-10-25T16:07:17.593Z"
+}

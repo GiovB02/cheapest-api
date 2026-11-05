@@ -33,6 +33,7 @@ services:
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ${DB_NAME:-cheapest}
+      DB_SSL: "false"
       PORT: 3001
     depends_on:
       postgres:
@@ -54,6 +55,7 @@ services:
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ${DB_NAME:-cheapest}
+      DB_SSL: "false"
       LOGISTICA_BASE_URL: http://logistica:3001
       PORT: 3002
     depends_on:
@@ -99,6 +101,7 @@ services:
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ${DB_NAME:-cheapest}
+      DB_SSL: "false"
       LOGISTICA_BASE_URL: http://logistica:3001
       PORT: 3003
       # Point ventas at the sidecar proxy, not directly at inventario.

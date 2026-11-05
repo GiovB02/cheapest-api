@@ -1,0 +1,19 @@
+﻿{
+  "archivo": "C:\\Users\\Giovanna\\OneDrive - Escuela Superior de Economia y Negocios\\Documentos\\UNIANDES\\ArquitecturaDeSoftwareRobustas\\Laboratorios\\cheapest-api\\lab5-pruebas\\resultados\\ronda2_1500hilos.jtl",
+  "peticiones": 1500,
+  "p50_ms": 5295,
+  "p95_ms": 15300,
+  "p99_ms": 15387,
+  "max_ms": 20034,
+  "error_pct": 0.2,
+  "throughput_rps": 16.15,
+  "respuestas_201": 1497,
+  "con_pending_stock_confirmation": 1360,
+  "pct_429": 0,
+  "codigos": {
+    "201": 1497,
+    "Non HTTP response code: org.apache.http.conn.ConnectTimeoutException": 3
+  },
+  "inicio": "2026-10-25T16:09:56.427Z",
+  "fin": "2026-10-25T16:11:29.282Z"
+}

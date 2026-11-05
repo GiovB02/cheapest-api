@@ -1,0 +1,21 @@
+﻿{
+  "archivo": "lab5-pruebas\\resultados\\ronda4_saturacion.jtl",
+  "peticiones": 14198,
+  "p50_ms": 1303,
+  "p95_ms": 2028,
+  "p99_ms": 2257,
+  "max_ms": 2616,
+  "error_pct": 22.61,
+  "throughput_rps": 117.3,
+  "respuestas_201": 10988,
+  "con_pending_stock_confirmation": 0,
+  "pct_429": 22.59,
+  "codigos": {
+    "201": 10988,
+    "429": 3208,
+    "502": 1,
+    "503": 1
+  },
+  "inicio": "2026-10-25T18:56:09.289Z",
+  "fin": "2026-10-25T18:58:10.334Z"
+}
